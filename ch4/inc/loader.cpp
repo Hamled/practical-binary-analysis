@@ -12,6 +12,7 @@ extern "C" {
 static int load_binary_bfd(std::string &fname, Binary *bin, Binary::BinaryType type);
 
 static int load_binary_lem(std::string &fname, Binary *bin);
+static int load_symbols_lem(elfobj_t &obj, Binary *bin);
 
 int
 load_binary(std::string &fname, Binary *bin, Binary::BinaryType type)
@@ -338,6 +339,9 @@ load_binary_lem(std::string &fname, Binary *bin)
     goto fail;
   }
 
+  /* Symbol handling is best-effort only (they may not even be present) */
+  load_symbols_lem(obj, bin);
+
   ret = 0;
   goto cleanup;
 
@@ -348,4 +352,29 @@ cleanup:
   elf_close_object(&obj);
 
   return ret;
+}
+
+static int
+load_symbols_lem(elfobj_t &obj, Binary *bin)
+{
+  elf_symtab_iterator_t symtab_iter;
+  struct elf_symbol symbol;
+
+  if(!(obj.flags & ELF_SYMTAB_F)) {
+    return 0;
+  }
+
+  elf_symtab_iterator_init(&obj, &symtab_iter);
+  while(elf_symtab_iterator_next(&symtab_iter, &symbol) == ELF_ITER_OK) {
+    if(symbol.type == STT_FUNC) {
+      Symbol s = Symbol();
+      s.type = Symbol::SYM_TYPE_FUNC;
+      s.name = symbol.name;
+      s.addr = symbol.value;
+
+      bin->symbols.push_back(s);
+    }
+  }
+
+  return 0;
 }

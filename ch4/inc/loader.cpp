@@ -20,7 +20,20 @@ static int load_sections_lem(elfobj_t &obj, Binary *bin);
 int
 load_binary(std::string &fname, Binary *bin, Binary::BinaryType type)
 {
-  return load_binary_bfd(fname, bin, type);
+  switch(type) {
+  case Binary::BIN_TYPE_AUTO:
+  case Binary::BIN_TYPE_ELF: {
+    // Try with libelfmaster first, then fall back to BFD
+    const int ret = load_binary_lem(fname, bin);
+    if(ret == 0 || type == Binary::BIN_TYPE_ELF) {
+      return ret;
+    }
+  }
+
+  case Binary::BIN_TYPE_PE:
+  default:
+    return load_binary_bfd(fname, bin, type);
+  }
 }
 
 void

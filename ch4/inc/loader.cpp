@@ -4,13 +4,36 @@
 
 #include <bfd.h>
 #include "loader.hpp"
+#include <cstring>
+
+extern "C" {
+#include <libelfmaster.h>
+}
 
 static int load_binary_bfd(std::string &fname, Binary *bin, Binary::BinaryType type);
+
+static int load_binary_lem(std::string &fname, Binary *bin);
+static int load_symbols_lem(elfobj_t &obj, Binary *bin);
+static int load_dynsym_lem(elfobj_t &obj, Binary *bin);
+static int load_sections_lem(elfobj_t &obj, Binary *bin);
 
 int
 load_binary(std::string &fname, Binary *bin, Binary::BinaryType type)
 {
-  return load_binary_bfd(fname, bin, type);
+  switch(type) {
+  case Binary::BIN_TYPE_AUTO:
+  case Binary::BIN_TYPE_ELF: {
+    // Try with libelfmaster first, then fall back to BFD
+    const int ret = load_binary_lem(fname, bin);
+    if(ret == 0 || type == Binary::BIN_TYPE_ELF) {
+      return ret;
+    }
+  }
+
+  case Binary::BIN_TYPE_PE:
+  default:
+    return load_binary_bfd(fname, bin, type);
+  }
 }
 
 void
@@ -292,4 +315,168 @@ cleanup:
   if(bfd_h) bfd_close(bfd_h);
 
   return ret;
+}
+
+static int
+load_binary_lem(std::string &fname, Binary *bin)
+{
+  int ret;
+  elf_error_t error;
+  elfobj_t obj;
+
+  if(elf_open_object(fname.c_str(), &obj, ELF_LOAD_F_FORENSICS, &error) == false) {
+    return -1;
+  }
+
+  bin->filename = std::string(fname);
+  bin->type     = Binary::BIN_TYPE_ELF;
+  bin->entry    = elf_entry_point(&obj);
+  // This gets set in the BFD path to the BFD taret name
+  // which AFAICT is entirely specific to BFD / GNU binutils.
+  // In the case of loading the binary with libelfmaster just skip it.
+  bin->type_str = "unknown";
+
+
+  switch(obj.arch) {
+  case i386:
+    bin->arch_str = "X86";
+    bin->arch = Binary::ARCH_X86;
+    bin->bits = 32;
+    break;
+  case x64:
+    bin->arch_str = "X86_64";
+    bin->arch = Binary::ARCH_X86;
+    bin->bits = 64;
+    break;
+  case unsupported:
+  default:
+    fprintf(stderr, "unsupported architecture (%d)\n",
+            obj.arch);
+    goto fail;
+  }
+
+  /* Symbol handling is best-effort only (they may not even be present) */
+  load_symbols_lem(obj, bin);
+  load_dynsym_lem(obj, bin);
+
+  if(load_sections_lem(obj, bin) < 0) goto fail;
+
+  ret = 0;
+  goto cleanup;
+
+fail:
+  ret = -1;
+
+cleanup:
+  elf_close_object(&obj);
+
+  return ret;
+}
+
+static int
+load_symbols_lem(elfobj_t &obj, Binary *bin)
+{
+  elf_symtab_iterator_t symtab_iter;
+  struct elf_symbol symbol;
+
+  if(!(obj.flags & ELF_SYMTAB_F)) {
+    return 0;
+  }
+
+  elf_symtab_iterator_init(&obj, &symtab_iter);
+  while(elf_symtab_iterator_next(&symtab_iter, &symbol) == ELF_ITER_OK) {
+    if(symbol.type == STT_FUNC) {
+      Symbol s = Symbol();
+      s.type = Symbol::SYM_TYPE_FUNC;
+      s.name = symbol.name;
+      s.addr = symbol.value;
+
+      bin->symbols.push_back(s);
+    }
+  }
+
+  return 0;
+}
+
+static int
+load_dynsym_lem(elfobj_t &obj, Binary *bin)
+{
+  elf_dynsym_iterator_t dynsym_iter;
+  struct elf_symbol symbol;
+
+  if(!(obj.flags & ELF_DYNSYM_F)) {
+    return 0;
+  }
+
+  elf_dynsym_iterator_init(&obj, &dynsym_iter);
+  while(elf_dynsym_iterator_next(&dynsym_iter, &symbol) == ELF_ITER_OK) {
+    if(symbol.type == STT_FUNC) {
+      Symbol s = Symbol();
+      s.type = Symbol::SYM_TYPE_FUNC;
+      s.name = symbol.name;
+      s.addr = symbol.value;
+
+      bin->symbols.push_back(s);
+    }
+  }
+
+  return 0;
+}
+
+static int
+load_sections_lem(elfobj_t &obj, Binary *bin)
+{
+  elf_section_iterator_t section_iter;
+  struct elf_section section;
+
+  if(!(obj.flags & ELF_SHDRS_F)) {
+    return 0;
+  }
+
+  elf_section_iterator_init(&obj, &section_iter);
+  while(elf_section_iterator_next(&section_iter, &section) == ELF_ITER_OK) {
+    if(section.type == SHT_NOBITS) {
+      continue; // Nothing to load, skip it
+    }
+
+    Section::SectionType type;
+    if(section.flags & SHF_EXECINSTR) {
+      type = Section::SEC_TYPE_CODE;
+    } else if(section.flags & SHF_ALLOC) {
+      type = Section::SEC_TYPE_DATA;
+    } else {
+      continue; // We only care about code and data sections
+    }
+
+    Section s = Section();
+    s.binary = bin;
+    s.type = type;
+    s.name = std::string(section.name ? section.name : "<unnamed>");
+    s.vma = section.address;
+    s.size = section.size;
+    s.bytes = (uint8_t *)malloc(s.size);
+    if(!s.bytes) {
+      fprintf(stderr, "failed to allocate memory for section '%s' of size %ju\n",
+              s.name.c_str(), s.size);
+      goto fail;
+    }
+
+    // Copy the section data into the malloc'd buffer from above
+    const uint8_t *data = (uint8_t *)elf_section_pointer(&obj, &section);
+    memcpy(s.bytes, data, s.size);
+
+    bin->sections.push_back(s);
+  }
+
+  return 0;
+
+fail:
+  for(auto &sec : bin->sections) {
+    if(sec.bytes) {
+      free(sec.bytes);
+      sec.bytes = NULL;
+    }
+  }
+
+  return -1;
 }

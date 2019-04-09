@@ -5,7 +5,13 @@
 #include <bfd.h>
 #include "loader.hpp"
 
+extern "C" {
+#include <libelfmaster.h>
+}
+
 static int load_binary_bfd(std::string &fname, Binary *bin, Binary::BinaryType type);
+
+static int load_binary_lem(std::string &fname, Binary *bin);
 
 int
 load_binary(std::string &fname, Binary *bin, Binary::BinaryType type)
@@ -290,6 +296,56 @@ fail:
 
 cleanup:
   if(bfd_h) bfd_close(bfd_h);
+
+  return ret;
+}
+
+static int
+load_binary_lem(std::string &fname, Binary *bin)
+{
+  int ret;
+  elf_error_t error;
+  elfobj_t obj;
+
+  if(elf_open_object(fname.c_str(), &obj, ELF_LOAD_F_FORENSICS, &error) == false) {
+    return -1;
+  }
+
+  bin->filename = std::string(fname);
+  bin->type     = Binary::BIN_TYPE_ELF;
+  bin->entry    = elf_entry_point(&obj);
+  // This gets set in the BFD path to the BFD taret name
+  // which AFAICT is entirely specific to BFD / GNU binutils.
+  // In the case of loading the binary with libelfmaster just skip it.
+  bin->type_str = "unknown";
+
+
+  switch(obj.arch) {
+  case i386:
+    bin->arch_str = "X86";
+    bin->arch = Binary::ARCH_X86;
+    bin->bits = 32;
+    break;
+  case x64:
+    bin->arch_str = "X86_64";
+    bin->arch = Binary::ARCH_X86;
+    bin->bits = 64;
+    break;
+  case unsupported:
+  default:
+    fprintf(stderr, "unsupported architecture (%d)\n",
+            obj.arch);
+    goto fail;
+  }
+
+  ret = 0;
+  goto cleanup;
+
+fail:
+  ret = -1;
+
+cleanup:
+  elf_close_object(&obj);
 
   return ret;
 }
